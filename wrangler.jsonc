@@ -23,7 +23,7 @@
   "r2_buckets": [
     {
       "binding": "PRODUCT_IMAGES",
-      "bucket_name": "${R2_BUCKET_NAME}"
+      "bucket_name": "pmelab-single-product-images"
     }
   ]
 }
