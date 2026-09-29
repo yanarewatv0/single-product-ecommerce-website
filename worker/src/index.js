@@ -26,6 +26,11 @@ export default {
             return handlePaystackWebhook(request, env);
         }
 
+        // Flutterwave Webhook
+        if (path === '/api/flutterwave-webhook' && request.method === 'POST') {
+            return handleFlutterwaveWebhook(request, env);
+        }
+
         // Verify Payment
         if (path === '/api/verify-payment' && request.method === 'POST') {
             return handleVerifyPayment(request, env);
@@ -71,6 +76,11 @@ export default {
             return handleOwnerConfigSave(request, env);
         }
 
+        // Owner image upload to R2
+        if (path === '/api/owner/upload' && request.method === 'POST') {
+            return handleOwnerUpload(request, env);
+        }
+
         // Public payment / order status lookup
         if (path === '/api/payment-status' && request.method === 'GET') {
             return handlePaymentStatus(request, env);
@@ -78,6 +88,11 @@ export default {
 
         if (path === '/api/health' && request.method === 'GET') {
             return handleHealthCheck(env);
+        }
+
+        // CDN serving from R2 bucket (public image routes)
+        if (path.startsWith('/cdn/')) {
+            return handleCdnServe(request, env);
         }
 
         if (path.startsWith('/api/')) {
@@ -156,14 +171,12 @@ async function handlePaystackWebhook(request, env) {
 // =========================================================
 async function handleVerifyPayment(request, env) {
     try {
-        const secret = env.PAYSTACK_SECRET_KEY;
-        if (!secret) {
-            return jsonResponse({ success: false, error: 'Payment not configured. Missing PAYSTACK_SECRET_KEY.', retryable: false }, 503);
-        }
-
         const data = await request.json();
         const {
             reference,
+            tx_ref,
+            transaction_id,
+            provider,
             package_id,
             expected_amount,
             currency,
@@ -185,6 +198,133 @@ async function handleVerifyPayment(request, env) {
         let resolvedItems = null;
         let resolvedSubtotal = null;
         let resolvedPackageId = String(package_id || '').trim();
+
+        const detected = detectFlutterwaveProvider({ provider: provider, tx_ref: tx_ref, transaction_id: transaction_id, reference: reference });
+        const orderRef = String(detected.tx_ref || reference || '');
+
+        if (detected.provider === 'flutterwave') {
+            const secret = env.FLUTTERWAVE_SECRET_KEY;
+            if (!secret) {
+                return jsonResponse({ success: false, error: 'Payment not configured. Missing FLUTTERWAVE_SECRET_KEY.', retryable: false }, 503);
+            }
+
+            const verifyResult = await verifyFlutterwaveTransaction({
+                secret: secret,
+                transactionId: transaction_id,
+                txRef: tx_ref
+            });
+
+            if (!verifyResult || !verifyResult.success) {
+                const message = String(verifyResult && verifyResult.message ? verifyResult.message : 'Transaction not found');
+                const retryable = isRetryablePaystackFailure(message);
+
+                if (retryable) {
+                    return jsonResponse({ success: false, error: message, retryable: true }, 409);
+                }
+
+                await updateOwnerStats(env, function(stats) { stats.failedSalesCount += 1; });
+                await sendOrderNotifications(env, {
+                    event: 'flutterwave_attempt_failed',
+                    title: 'Flutterwave verification failed',
+                    orderRef: orderRef,
+                    packageId: package_id,
+                    amount: expectedAmount,
+                    currency: expectedCurrency,
+                    customer: customer,
+                    details: ['Reason: ' + message]
+                });
+                return jsonResponse({ success: false, error: message, retryable: false }, 404);
+            }
+
+            const transaction = verifyResult.data;
+            const flwStatus = String(transaction && transaction.status ? transaction.status : '').toLowerCase();
+            if (flwStatus !== 'successful' && flwStatus !== 'success') {
+                if (flwStatus === 'pending' || flwStatus === 'ongoing' || flwStatus === 'processing' || flwStatus === 'queued' || flwStatus === 'unknown' || !flwStatus) {
+                    return jsonResponse({
+                        success: false,
+                        error: 'Payment confirmation is still pending',
+                        retryable: true,
+                        transaction_status: flwStatus || 'pending'
+                    }, 409);
+                }
+                await updateOwnerStats(env, function(stats) { stats.failedSalesCount += 1; });
+                await sendOrderNotifications(env, {
+                    event: 'flutterwave_attempt_failed',
+                    title: 'Flutterwave payment not completed',
+                    orderRef: orderRef,
+                    packageId: package_id,
+                    amount: expectedAmount,
+                    currency: expectedCurrency,
+                    customer: customer,
+                    details: ['Transaction status: ' + flwStatus]
+                });
+                return jsonResponse({ success: false, error: 'Payment is not successful', transaction_status: flwStatus, retryable: false }, 400);
+            }
+
+            const expectedCents = Math.round(expectedAmount * 100);
+            const chargedAmount = Number(transaction && transaction.amount ? transaction.amount : 0);
+            const chargedCents = Math.round(chargedAmount * 100);
+            if (chargedCents !== expectedCents) {
+                await updateOwnerStats(env, function(stats) { stats.failedSalesCount += 1; });
+                await sendOrderNotifications(env, {
+                    event: 'flutterwave_attempt_failed',
+                    title: 'Flutterwave amount mismatch',
+                    orderRef: orderRef,
+                    packageId: package_id,
+                    amount: expectedAmount,
+                    currency: expectedCurrency,
+                    customer: customer,
+                    details: [
+                        'Expected: ' + expectedAmount + ' ' + expectedCurrency,
+                        'Received: ' + chargedAmount + ' ' + String((transaction && transaction.currency) || '').toUpperCase()
+                    ]
+                });
+                return jsonResponse({ success: false, error: 'Amount mismatch', retryable: false }, 400);
+            }
+
+            const receivedCurrency = String((transaction && transaction.currency) || '').toUpperCase();
+            if (receivedCurrency && receivedCurrency !== expectedCurrency) {
+                await updateOwnerStats(env, function(stats) { stats.failedSalesCount += 1; });
+                await sendOrderNotifications(env, {
+                    event: 'flutterwave_attempt_failed',
+                    title: 'Flutterwave currency mismatch',
+                    orderRef: orderRef,
+                    packageId: package_id,
+                    amount: expectedAmount,
+                    currency: expectedCurrency,
+                    customer: customer,
+                    details: ['Expected currency: ' + expectedCurrency, 'Received currency: ' + receivedCurrency]
+                });
+                return jsonResponse({ success: false, error: 'Currency mismatch', retryable: false }, 400);
+            }
+
+            const result = await confirmFlutterwavePayment(env, {
+                transaction: transaction,
+                packageId: resolvedPackageId,
+                packageTitle: resolvedPackageTitle,
+                expectedAmount: expectedAmount,
+                subtotal: resolvedSubtotal,
+                currency: expectedCurrency,
+                customer: customer,
+                productId: resolvedProductId,
+                productTitle: resolvedProductTitle,
+                quantity: resolvedQuantity,
+                shippingFee: resolvedShippingFee,
+                items: resolvedItems,
+                source: 'frontend_verify'
+            });
+
+            return jsonResponse({
+                success: true,
+                duplicate: result.duplicate === true,
+                warnings: result.warnings || []
+            });
+        }
+
+        const secret = env.PAYSTACK_SECRET_KEY;
+        if (!secret) {
+            return jsonResponse({ success: false, error: 'Payment not configured. Missing PAYSTACK_SECRET_KEY.', retryable: false }, 503);
+        }
 
         const verifyResult = await verifyPaystackTransaction(reference, secret);
         if (!verifyResult.status) {
@@ -321,6 +461,20 @@ async function handleVerifyPayment(request, env) {
             retryable: true
         }, 502);
     }
+}
+
+function detectFlutterwaveProvider(params) {
+    const explicit = String(params.provider || '').toLowerCase().trim();
+    if (explicit === 'flutterwave') {
+        return { provider: 'flutterwave', tx_ref: params.tx_ref, transaction_id: params.transaction_id };
+    }
+    if (explicit === 'paystack') {
+        return { provider: 'paystack', reference: params.reference };
+    }
+    if (params.tx_ref || params.transaction_id) {
+        return { provider: 'flutterwave', tx_ref: params.tx_ref, transaction_id: params.transaction_id };
+    }
+    return { provider: 'paystack', reference: params.reference };
 }
 
 // =========================================================
@@ -543,11 +697,11 @@ async function handleTrackOrderAttempt(request, env) {
     const reason = String(data.reason || 'unknown');
 
     await updateOwnerStats(env, function(stats) {
-        if (reason === 'paystack_started') {
+        if (reason === 'paystack_started' || reason === 'flutterwave_started') {
             stats.salesAttemptsCount += 1;
         }
 
-        if (reason === 'paystack_closed') {
+        if (reason === 'paystack_closed' || reason === 'flutterwave_closed') {
             stats.abandonedCheckoutCount += 1;
         }
     });
@@ -562,6 +716,19 @@ async function handleTrackOrderAttempt(request, env) {
             currency: data.currency,
             customer: data.customer,
             details: ['Reason: Customer closed Paystack before completing payment']
+        });
+    }
+
+    if (reason === 'flutterwave_closed') {
+        await sendOrderNotifications(env, {
+            event: 'flutterwave_attempt_abandoned',
+            title: 'Checkout abandoned',
+            orderRef: data.orderRef || 'N/A',
+            packageId: data.packageId,
+            amount: data.amount,
+            currency: data.currency,
+            customer: data.customer,
+            details: ['Reason: Customer closed Flutterwave before completing payment']
         });
     }
 
@@ -688,6 +855,27 @@ async function handleOwnerOrderLookup(request, env) {
         } catch (error) {}
     }
 
+    if (!record && env.FLUTTERWAVE_SECRET_KEY) {
+        try {
+            const flwVerify = await verifyFlutterwaveTransaction({
+                secret: env.FLUTTERWAVE_SECRET_KEY,
+                txRef: reference
+            });
+            if (flwVerify && flwVerify.success && flwVerify.data) {
+                const flwStatus = String(flwVerify.data.status || '').toLowerCase();
+                if (flwStatus === 'successful' || flwStatus === 'success') {
+                    await confirmFlutterwavePayment(env, {
+                        transaction: flwVerify.data,
+                        expectedAmount: Number(flwVerify.data.amount || 0),
+                        currency: flwVerify.data.currency,
+                        source: 'owner_lookup'
+                    });
+                    record = await getPaymentRecord(env, reference);
+                }
+            }
+        } catch (error) {}
+    }
+
     if (!record) {
         return jsonResponse({ success: false, found: false, error: 'Payment record not found' }, 404);
     }
@@ -733,6 +921,50 @@ async function handlePaymentStatus(request, env) {
                     retryable: false,
                     error: String(verifyResult.message || 'Transaction not found')
                 }, 404);
+            }
+        } catch (error) {
+            return jsonResponse({
+                success: false,
+                found: false,
+                retryable: true,
+                error: error && error.message ? error.message : 'Status check failed'
+            }, 409);
+        }
+    }
+
+    if (!record && env.FLUTTERWAVE_SECRET_KEY) {
+        try {
+            const flwVerify = await verifyFlutterwaveTransaction({
+                secret: env.FLUTTERWAVE_SECRET_KEY,
+                txRef: reference
+            });
+            if (flwVerify && flwVerify.success && flwVerify.data) {
+                const flwStatus = String(flwVerify.data.status || '').toLowerCase();
+                if (flwStatus === 'successful' || flwStatus === 'success') {
+                    await confirmFlutterwavePayment(env, {
+                        transaction: flwVerify.data,
+                        expectedAmount: Number(flwVerify.data.amount || 0),
+                        currency: flwVerify.data.currency,
+                        source: 'status_lookup'
+                    });
+                    record = await getPaymentRecord(env, reference);
+                } else if (flwStatus === 'pending' || flwStatus === 'ongoing' || flwStatus === 'processing' || flwStatus === 'queued' || flwStatus === 'unknown' || !flwStatus) {
+                    return jsonResponse({
+                        success: false,
+                        found: false,
+                        retryable: true,
+                        error: 'Payment status is ' + (flwStatus || 'pending')
+                    }, 409);
+                }
+            } else if (flwVerify && !flwVerify.success) {
+                const message = String(flwVerify.message || 'Transaction not found');
+                const retryable = isRetryablePaystackFailure(message);
+                return jsonResponse({
+                    success: false,
+                    found: false,
+                    retryable: retryable,
+                    error: message
+                }, retryable ? 409 : 404);
             }
         } catch (error) {
             return jsonResponse({
@@ -835,13 +1067,18 @@ function getPaystackFailureHint(message) {
 function handleHealthCheck(env) {
     const username = env.OWNER_DASHBOARD_USERNAME || env.OWNER_USERNAME;
     const password = env.OWNER_DASHBOARD_PASSWORD || env.OWNER_PASSWORD;
+    const r2Bucket = env.PRODUCT_IMAGES;
     const checks = {
         ownerStatsBound: Boolean(env.OWNER_STATS),
         paystackSecretConfigured: Boolean(env.PAYSTACK_SECRET_KEY),
+        flutterwaveSecretConfigured: Boolean(env.FLUTTERWAVE_SECRET_KEY),
+        flutterwavePublicKeyEnvConfigured: Boolean(env.FLUTTERWAVE_PUBLIC_KEY),
         ownerEmailConfigured: Boolean(env.OWNER_EMAIL),
         ownerDashboardCredsConfigured: Boolean(username && password),
         gmailSmtpConfigured: Boolean(env.GMAIL_SMTP_USER && env.GMAIL_SMTP_PASSWORD),
-        resendConfigured: Boolean(env.RESEND_API_KEY)
+        resendConfigured: Boolean(env.RESEND_API_KEY),
+        r2BucketBound: Boolean(r2Bucket),
+        r2BucketNamed: Boolean(env.R2_BUCKET_NAME)
     };
     const missing = Object.keys(checks).filter(function(key) { return checks[key] === false; });
     let availableKeys = [];
@@ -1301,8 +1538,9 @@ function formatNotificationAmount(amount, currency) {
 }
 
 function getNotificationColor(eventName) {
-    if (eventName === 'paystack_attempt_failed') return 15158332;
-    if (eventName === 'paystack_attempt_abandoned') return 16753920;
+    if (eventName === 'paystack_attempt_failed' || eventName === 'flutterwave_attempt_failed') return 15158332;
+    if (eventName === 'paystack_attempt_abandoned' || eventName === 'flutterwave_attempt_abandoned') return 16753920;
+    if (eventName === 'paystack_order_verified' || eventName === 'flutterwave_order_verified') return 3066993;
     if (eventName === 'manual_order_received') return 3447003;
     return 3066993;
 }
@@ -1326,15 +1564,31 @@ async function getEmailContext(env) {
     const brand = site && site.BRAND ? site.BRAND : {};
     const product = site && site.PRODUCT ? site.PRODUCT : {};
     const packages = site && Array.isArray(site.PACKAGES) ? site.PACKAGES : [];
+    const logo = site && site.LOGO ? site.LOGO : { type: 'text', image: 'logo.jpg' };
 
     const website = String(business.website || env.BUSINESS_WEBSITE || '').trim();
     let logoUrl = '';
-    if (website) {
-        try {
-            logoUrl = new URL('/productsimages/logo.jpg', website).toString();
-        } catch (error) {
-            logoUrl = '';
+    const logoImage = String(logo.image || 'logo.jpg').trim();
+    const r2Public = String(env.R2_PUBLIC_URL || '').trim().replace(/\/+$/, '');
+    const r2Custom = String(env.R2_CUSTOM_DOMAIN || '').trim().replace(/\/+$/, '');
+    const cdnBase = r2Custom || r2Public;
+
+    if (logoImage.startsWith('/cdn/')) {
+        if (cdnBase) {
+            try {
+                logoUrl = (cdnBase + logoImage).toString();
+            } catch (error) { logoUrl = ''; }
+        } else if (website) {
+            try {
+                logoUrl = new URL(logoImage, website).toString();
+            } catch (error) { logoUrl = ''; }
         }
+    } else if (/^(https?:)?\/\//i.test(logoImage)) {
+        logoUrl = logoImage;
+    } else if (website) {
+        try {
+            logoUrl = new URL('/productsimages/' + (logoImage || 'logo.jpg'), website).toString();
+        } catch (error) { logoUrl = ''; }
     }
 
     const resolvedBrand = {
@@ -1356,7 +1610,8 @@ async function getEmailContext(env) {
             business: business,
             brand: brand,
             product: product,
-            packages: packages
+            packages: packages,
+            logo: logo
         },
         brand: resolvedBrand
     };
@@ -2294,6 +2549,449 @@ function arrayBufferToBase64(buffer) {
     }
 
     return btoa(binary);
+}
+
+// =========================================================
+// FLUTTERWAVE WEBHOOK HANDLER
+// =========================================================
+async function handleFlutterwaveWebhook(request, env) {
+    const secret = env.FLUTTERWAVE_SECRET_KEY;
+    if (!secret) {
+        return jsonResponse({ error: 'Payment not configured' }, 500);
+    }
+
+    const verifHash = env.FLUTTERWAVE_WEBHOOK_HASH;
+    const signature = request.headers.get('verif-hash') || request.headers.get('x-flutterwave-signature') || '';
+    if (verifHash && signature !== verifHash) {
+        return jsonResponse({ error: 'Invalid signature' }, 400);
+    }
+
+    const body = await request.text();
+    let event;
+    try {
+        event = JSON.parse(body);
+    } catch (error) {
+        return jsonResponse({ error: 'Invalid JSON payload' }, 400);
+    }
+
+    const eventType = String(event.event || event.type || '').toLowerCase();
+    const chargeCompleted = eventType === 'charge.completed' || eventType === 'transaction.completed';
+    if (chargeCompleted) {
+        const txData = event.data || {};
+        const txRef = String(txData.tx_ref || txData.txRef || '').trim();
+        const txId = txData.id || txData.transaction_id || null;
+
+        const verifyResult = await verifyFlutterwaveTransaction({
+            secret: secret,
+            transactionId: txId,
+            txRef: txRef
+        });
+
+        if (!verifyResult || !verifyResult.success || !verifyResult.data) {
+            return jsonResponse({ received: true, ignored: true, reason: 'Verification failed' });
+        }
+
+        const transaction = verifyResult.data;
+        const flwStatus = String(transaction.status || '').toLowerCase();
+        if (flwStatus !== 'successful' && flwStatus !== 'success') {
+            return jsonResponse({ received: true, ignored: true, reason: 'Transaction not successful: ' + flwStatus });
+        }
+
+        const customer = extractCustomerFromFlutterwaveTransaction(transaction);
+        const expectedAmount = Number(transaction.amount || 0);
+        const currency = transaction.currency || '';
+
+        await confirmFlutterwavePayment(env, {
+            transaction: transaction,
+            expectedAmount: expectedAmount,
+            currency: currency,
+            customer: customer,
+            source: 'webhook'
+        });
+
+        return jsonResponse({ success: true, source: 'webhook' });
+    }
+
+    return jsonResponse({ received: true });
+}
+
+// =========================================================
+// FLUTTERWAVE VERIFY / CONFIRM HELPERS
+// =========================================================
+async function verifyFlutterwaveTransaction(options) {
+    const secret = options.secret;
+    const transactionId = options.transactionId;
+    const txRef = options.txRef;
+    const jobs = [];
+
+    if (transactionId) {
+        jobs.push((async function() {
+            try {
+                const response = await withTimeout(
+                    fetch('https://api.flutterwave.com/v3/transactions/' + encodeURIComponent(transactionId) + '/verify', {
+                        headers: {
+                            'Authorization': 'Bearer ' + secret,
+                            'Content-Type': 'application/json'
+                        }
+                    }),
+                    10000,
+                    'Flutterwave verify by id timed out'
+                );
+                const payload = await response.json().catch(function() {
+                    return { status: 'error', message: 'Unable to read Flutterwave response' };
+                });
+                if (payload && (payload.status === 'success' || payload.success === true) && payload.data) {
+                    return payload;
+                }
+                return null;
+            } catch (error) {
+                return null;
+            }
+        })());
+    }
+
+    if (txRef) {
+        jobs.push((async function() {
+            try {
+                const response = await withTimeout(
+                    fetch('https://api.flutterwave.com/v3/transactions/verify_by_reference?tx_ref=' + encodeURIComponent(txRef), {
+                        headers: {
+                            'Authorization': 'Bearer ' + secret,
+                            'Content-Type': 'application/json'
+                        }
+                    }),
+                    10000,
+                    'Flutterwave verify by reference timed out'
+                );
+                const payload = await response.json().catch(function() {
+                    return { status: 'error', message: 'Unable to read Flutterwave response' };
+                });
+                if (payload && (payload.status === 'success' || payload.success === true) && payload.data) {
+                    return payload;
+                }
+                return null;
+            } catch (error) {
+                return null;
+            }
+        })());
+    }
+
+    if (!jobs.length) {
+        return { success: false, message: 'Missing transaction_id or tx_ref' };
+    }
+
+    const results = await Promise.allSettled(jobs);
+    const successResults = results
+        .filter(function(r) { return r.status === 'fulfilled' && r.value; })
+        .map(function(r) { return r.value; });
+
+    if (successResults.length) {
+        const best = successResults[0];
+        return {
+            success: true,
+            data: best.data,
+            message: best.message || 'Verified'
+        };
+    }
+
+    const firstRejected = results.find(function(r) { return r.status === 'rejected'; });
+    if (firstRejected) {
+        return { success: false, message: firstRejected.reason && firstRejected.reason.message ? firstRejected.reason.message : 'Verification failed' };
+    }
+
+    const firstFulfilled = results.find(function(r) { return r.status === 'fulfilled'; });
+    if (firstFulfilled && firstFulfilled.value === null) {
+        return { success: false, message: 'Transaction not found' };
+    }
+    return { success: false, message: 'Verification failed' };
+}
+
+function extractCustomerFromFlutterwaveTransaction(transaction) {
+    const customer = transaction && transaction.customer ? transaction.customer : {};
+    const meta = transaction && transaction.meta && typeof transaction.meta === 'object' && !Array.isArray(transaction.meta) ? transaction.meta : {};
+
+    return {
+        name: String(meta.customer_name || customer.name || (customer.first_name ? customer.first_name + ' ' + (customer.last_name || '') : '') || '').trim(),
+        email: String(customer.email || meta.customer_email || '').trim(),
+        phone: String(meta.customer_phone || customer.phone_number || customer.phone || '').trim(),
+        address: String(meta.customer_address || '').trim(),
+        state: String(meta.customer_state || '').trim(),
+        city: String(meta.customer_city || '').trim(),
+        specialRequest: String(meta.customer_special_request || '').trim()
+    };
+}
+
+async function confirmFlutterwavePayment(env, options) {
+    const transaction = options.transaction || {};
+    const flwRef = String(transaction.flw_ref || transaction.flwRef || '').trim();
+    const txRef = String(transaction.tx_ref || transaction.txRef || '').trim();
+    const reference = txRef || flwRef || ('FLW-' + Date.now());
+    const packageId = options.packageId || (transaction.meta && transaction.meta.package) || '';
+    const packageTitle = options.packageTitle || (transaction.meta && transaction.meta.package_title) || packageId;
+    const quantity = Number(options.quantity || (transaction.meta && transaction.meta.quantity) || 0) || 1;
+    const customer = normalizeCustomerInfo(options.customer || extractCustomerFromFlutterwaveTransaction(transaction));
+    const amount = Number(options.expectedAmount || 0) || Number(transaction.amount || 0);
+    const subtotal = Number(options.subtotal || 0) || 0;
+    const currency = String(options.currency || transaction.currency || '').toUpperCase();
+    const existing = await getPaymentRecord(env, reference);
+    const warnings = [];
+
+    if (existing && existing.paymentStatus === 'verified') {
+        return { duplicate: true, warnings: existing.warnings || [] };
+    }
+
+    const record = {
+        reference: reference,
+        orderType: 'flutterwave',
+        paymentStatus: 'verified',
+        orderStatus: 'received',
+        packageId: packageId,
+        packageTitle: packageTitle,
+        quantity: quantity,
+        subtotal: subtotal,
+        amount: amount,
+        currency: currency,
+        customer: customer,
+        productId: String(options.productId || (transaction.meta && transaction.meta.product_id) || ''),
+        productTitle: String(options.productTitle || (transaction.meta && transaction.meta.product_title) || ''),
+        shippingFee: Number(options.shippingFee || 0) || 0,
+        items: Array.isArray(options.items) ? options.items : undefined,
+        transactionStatus: transaction.status || 'successful',
+        source: options.source || 'frontend_verify',
+        verifiedAt: new Date().toISOString()
+    };
+
+    await putPaymentRecord(env, reference, record);
+    await updateOwnerStats(env, function(stats) {
+        stats.successfulSalesCount += 1;
+        stats.successfulSalesAmount += Number(amount || 0);
+    });
+
+    try {
+        await sendOrderEmails({
+            reference: reference,
+            amount: amount * 100,
+            currency: currency,
+            status: transaction.status || 'successful',
+            metadata: {
+                custom_fields: [
+                    { variable_name: 'package', display_name: 'Package', value: packageId },
+                    { variable_name: 'quantity', display_name: 'Quantity', value: String(quantity) }
+                ]
+            },
+            customer: { email: customer.email, first_name: customer.name }
+        }, env, 'flutterwave', customer, record);
+    } catch (error) {
+        warnings.push('flutterwave_email_failed');
+        console.error('Flutterwave order email failed:', error && error.message ? error.message : error);
+    }
+
+    try {
+        await sendOrderNotifications(env, {
+            event: 'flutterwave_order_verified',
+            title: 'New Flutterwave order verified',
+            orderRef: reference,
+            packageId: packageId,
+            amount: amount,
+            currency: currency,
+            customer: customer,
+            details: [
+                'Status: ' + (transaction.status || 'successful'),
+                'Source: ' + (options.source || 'frontend_verify')
+            ]
+        });
+    } catch (error) {
+        warnings.push('flutterwave_notification_failed');
+        console.error('Flutterwave order notification failed:', error && error.message ? error.message : error);
+    }
+
+    if (warnings.length) {
+        record.warnings = warnings.slice();
+        await putPaymentRecord(env, reference, record);
+    }
+
+    return { duplicate: false, warnings: warnings };
+}
+
+// =========================================================
+// CLOUDFLARE R2 UPLOAD + CDN
+// =========================================================
+const ALLOWED_IMAGE_TYPES = [
+    'image/jpeg',
+    'image/jpg',
+    'image/png',
+    'image/webp',
+    'image/gif',
+    'image/svg+xml',
+    'image/avif',
+    'image/bmp'
+];
+const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
+
+function isValidImageType(type) {
+    const clean = String(type || '').toLowerCase().trim();
+    return ALLOWED_IMAGE_TYPES.indexOf(clean) >= 0;
+}
+
+function r2FolderForKey(configKey) {
+    const key = String(configKey || '').toLowerCase();
+    if (key.indexOf('logo') >= 0) return 'logos';
+    if (key.indexOf('testimonial') >= 0) return 'testimonials';
+    if (key.indexOf('gallery') >= 0) return 'gallery';
+    if (key.indexOf('social') >= 0 && key.indexOf('image') >= 0) return 'seo';
+    if (key.indexOf('seo') >= 0 || key.indexOf('og:image') >= 0) return 'seo';
+    if (key.indexOf('product') >= 0 || key.indexOf('image') >= 0 || key.indexOf('file') >= 0) return 'products';
+    return 'general';
+}
+
+function sanitizeR2Name(value) {
+    const text = String(value || '').toLowerCase().replace(/\\/g, '/');
+    const last = text.lastIndexOf('/');
+    const baseName = last >= 0 ? text.slice(last + 1) : text;
+    return baseName
+        .replace(/[^a-z0-9._-]+/g, '-')
+        .replace(/-+/g, '-')
+        .replace(/^-|-$/g, '')
+        .slice(0, 120) || 'image';
+}
+
+async function handleOwnerUpload(request, env) {
+    const authorized = isOwnerAuthorized(request, env);
+    if (!authorized.ok) {
+        return jsonResponse({ success: false, error: authorized.error }, 401);
+    }
+
+    const bucket = env.PRODUCT_IMAGES;
+    if (!bucket || typeof bucket.put !== 'function') {
+        return jsonResponse({ success: false, error: 'R2 bucket is not bound. Add PRODUCT_IMAGES r2_bucket binding in wrangler.jsonc and set R2_BUCKET_NAME.' }, 503);
+    }
+
+    const contentType = request.headers.get('content-type') || '';
+    if (!contentType.includes('multipart/form-data')) {
+        return jsonResponse({ success: false, error: 'Expected multipart/form-data upload' }, 400);
+    }
+
+    let form;
+    try {
+        form = await request.formData();
+    } catch (error) {
+        return jsonResponse({ success: false, error: 'Invalid multipart payload' }, 400);
+    }
+
+    const file = form.get('file');
+    if (!file || typeof file.arrayBuffer !== 'function') {
+        return jsonResponse({ success: false, error: 'Missing file field' }, 400);
+    }
+
+    if (file.size > MAX_IMAGE_SIZE) {
+        return jsonResponse({ success: false, error: 'File is too large. Maximum size is 10 MB.' }, 413);
+    }
+
+    const rawType = String(file.type || '').toLowerCase().trim();
+    const extGuess = String(file.name || '').toLowerCase().split('.').pop();
+    let effectiveType = rawType;
+    if (!effectiveType || effectiveType === 'application/octet-stream') {
+        const typeByExt = {
+            'jpg': 'image/jpeg',
+            'jpeg': 'image/jpeg',
+            'png': 'image/png',
+            'webp': 'image/webp',
+            'gif': 'image/gif',
+            'svg': 'image/svg+xml',
+            'avif': 'image/avif',
+            'bmp': 'image/bmp'
+        };
+        if (typeByExt[extGuess]) effectiveType = typeByExt[extGuess];
+    }
+
+    if (!isValidImageType(effectiveType)) {
+        return jsonResponse({ success: false, error: 'Unsupported file type. Allowed: JPG, PNG, WebP, GIF, SVG, AVIF, BMP.' }, 415);
+    }
+
+    const configKey = String(form.get('key') || form.get('config_key') || '').trim();
+    const folder = r2FolderForKey(configKey);
+    const cleanBase = sanitizeR2Name(file.name || ('upload-' + Date.now()));
+    const nonce = Math.random().toString(36).slice(2, 8) + Date.now().toString(36);
+    const ext = String(cleanBase.split('.').pop() || '').toLowerCase() || (effectiveType.split('/').pop() === 'svg+xml' ? 'svg' : effectiveType.split('/').pop());
+    const baseWithoutExt = cleanBase.replace(/\.[^.]+$/, '') || 'image';
+    const objectKey = folder + '/' + baseWithoutExt + '-' + nonce + '.' + ext;
+
+    const buffer = await file.arrayBuffer();
+    const putOptions = {
+        httpMetadata: {
+            contentType: effectiveType,
+            cacheControl: 'public, max-age=31536000, immutable'
+        }
+    };
+
+    try {
+        await bucket.put(objectKey, buffer, putOptions);
+    } catch (error) {
+        console.error('R2 put failed:', error && error.message ? error.message : error);
+        return jsonResponse({ success: false, error: 'Unable to save image. R2 bucket may not be provisioned or credentials are invalid.' }, 502);
+    }
+
+    const publicUrl = '/cdn/' + objectKey;
+    return jsonResponse({
+        success: true,
+        url: publicUrl,
+        key: objectKey,
+        name: file.name || '',
+        size: file.size,
+        type: effectiveType
+    });
+}
+
+async function handleCdnServe(request, env) {
+    const bucket = env.PRODUCT_IMAGES;
+    if (!bucket || typeof bucket.get !== 'function') {
+        return new Response('CDN bucket not configured', { status: 503, headers: { 'Content-Type': 'text/plain' } });
+    }
+
+    const url = new URL(request.url);
+    const rawKey = url.pathname.replace(/^\/cdn\//, '').replace(/^\/+/, '');
+    const objectKey = decodeURIComponent(rawKey);
+    if (!objectKey) {
+        return new Response('Missing R2 key', { status: 400, headers: { 'Content-Type': 'text/plain' } });
+    }
+
+    let object = null;
+    try {
+        object = await bucket.get(objectKey);
+    } catch (error) {
+        console.error('R2 get failed:', error && error.message ? error.message : error);
+    }
+
+    if (!object) {
+        const fallbackPath = '/productsimages/' + objectKey.split('/').pop();
+        if (env.ASSETS && typeof env.ASSETS.fetch === 'function') {
+            try {
+                const fallbackRequest = new Request(new URL(fallbackPath, url.origin).toString(), request);
+                const fallbackResponse = await env.ASSETS.fetch(fallbackRequest);
+                if (fallbackResponse && fallbackResponse.ok) return fallbackResponse;
+            } catch (error) {}
+        }
+        return new Response('Not found', { status: 404, headers: { 'Content-Type': 'text/plain' } });
+    }
+
+    const headers = new Headers();
+    if (object.httpMetadata) {
+        if (object.httpMetadata.contentType) headers.set('Content-Type', object.httpMetadata.contentType);
+        if (object.httpMetadata.cacheControl) headers.set('Cache-Control', object.httpMetadata.cacheControl);
+        if (object.httpMetadata.contentEncoding) headers.set('Content-Encoding', object.httpMetadata.contentEncoding);
+        if (object.httpMetadata.contentDisposition) headers.set('Content-Disposition', object.httpMetadata.contentDisposition);
+        if (object.httpMetadata.contentLanguage) headers.set('Content-Language', object.httpMetadata.contentLanguage);
+    }
+    headers.set('ETag', '"' + object.httpEtag + '"');
+    if (object.checksums && object.checksums.sha384) {
+        headers.set('Digest', 'sha-384=' + object.checksums.sha384);
+    }
+    headers.set('Access-Control-Allow-Origin', '*');
+
+    return new Response(object.body, {
+        status: 200,
+        headers: headers
+    });
 }
 
 // =========================================================

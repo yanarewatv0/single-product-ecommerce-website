@@ -89,6 +89,65 @@
         return data;
     }
 
+    async function trackOrderAttempt(orderRef, event, extra) {
+        try {
+            const body = Object.assign({ order_ref: String(orderRef || ''), event: String(event || '') }, extra || {});
+            await fetch(getApiUrl('/api/track-order-attempt'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            }).catch(function() {});
+        } catch (e) {}
+    }
+
+    function openFlutterwavePayment(payload, customer, currency) {
+        return new Promise(function(resolve, reject) {
+            const publicKey = String((PAYMENT && PAYMENT.flutterwavePublicKey) ? PAYMENT.flutterwavePublicKey : '').trim();
+            const orderRef = String(payload.order_ref || '');
+            const amount = Number(payload.expected_amount || 0);
+            const fw = typeof window.FlutterwaveCheckout !== 'undefined' ? window.FlutterwaveCheckout
+                : (typeof window.getpaidSetup !== 'undefined' ? window.getpaidSetup : null);
+            if (!fw || typeof fw !== 'function') {
+                reject(new Error('Flutterwave SDK not loaded'));
+                return;
+            }
+            try {
+                fw({
+                    public_key: publicKey,
+                    tx_ref: orderRef,
+                    amount: amount,
+                    currency: currency,
+                    customer: {
+                        email: String(customer.email || ''),
+                        name: String(customer.name || ''),
+                        phone_number: String(customer.phone || '')
+                    },
+                    meta: {
+                        order_ref: orderRef,
+                        customer_name: String(customer.name || ''),
+                        customer_phone: String(customer.phone || ''),
+                        product_id: String(payload.product_id || ''),
+                        package_id: String(payload.package_id || '')
+                    },
+                    callback: function(response) {
+                        const txRef = response && (response.tx_ref || response.txRef) ? String(response.tx_ref || response.txRef) : orderRef;
+                        const transactionId = response && (response.transaction_id || response.transactionId || response.id)
+                            ? String(response.transaction_id || response.transactionId || response.id) : '';
+                        trackOrderAttempt(orderRef, 'flutterwave_callback', { tx_ref: txRef, transaction_id: transactionId, status: String(response && response.status || '') });
+                        resolve({ response: response, tx_ref: txRef, transaction_id: transactionId });
+                    },
+                    onclose: function() {
+                        trackOrderAttempt(orderRef, 'flutterwave_closed', {});
+                        reject(new Error('Payment window closed'));
+                    }
+                });
+                trackOrderAttempt(orderRef, 'flutterwave_started', { amount: amount, currency: currency });
+            } catch (error) {
+                reject(error && error.message ? error : new Error('Failed to open Flutterwave checkout'));
+            }
+        });
+    }
+
     async function submitManualOrder(payload, receiptFile) {
         const formData = new FormData();
         formData.append('order_ref', String(payload.order_ref || ''));
@@ -130,13 +189,16 @@
         const receiptGroup = $('#manual-receipt-group', form);
         const manualRadio = $('input[name="payment"][value="manual"]', form);
         const paystackRadio = $('input[name="payment"][value="paystack"]', form);
+        const flutterwaveRadio = $('input[name="payment"][value="flutterwave"]', form);
 
         const paystackEnabled = Boolean(PAYMENT && PAYMENT.paystackEnabled);
+        const flutterwaveEnabled = Boolean(PAYMENT && PAYMENT.flutterwaveEnabled);
         const manualEnabled = Boolean(PAYMENT && PAYMENT.manualEnabled && MANUAL_PAYMENT && MANUAL_PAYMENT.enabled);
 
         methods.forEach(function(card) {
             const key = String(card.getAttribute('data-payment') || '');
             if (key === 'paystack') card.style.display = paystackEnabled ? '' : 'none';
+            if (key === 'flutterwave') card.style.display = flutterwaveEnabled ? '' : 'none';
             if (key === 'manual') card.style.display = manualEnabled ? '' : 'none';
         });
 
@@ -173,8 +235,11 @@
 
         renderManualInfo();
 
-        if (!paystackEnabled && manualEnabled && manualRadio) manualRadio.checked = true;
-        if (!manualEnabled && paystackEnabled && paystackRadio) paystackRadio.checked = true;
+        if (paystackEnabled && paystackRadio) paystackRadio.checked = true;
+        if (!paystackEnabled && flutterwaveEnabled && flutterwaveRadio) flutterwaveRadio.checked = true;
+        if (!paystackEnabled && !flutterwaveEnabled && manualEnabled && manualRadio) manualRadio.checked = true;
+        if (!manualEnabled && !flutterwaveEnabled && paystackEnabled && paystackRadio) paystackRadio.checked = true;
+        if (!manualEnabled && !paystackEnabled && flutterwaveEnabled && flutterwaveRadio) flutterwaveRadio.checked = true;
 
         methods.forEach(function(card) {
             card.addEventListener('click', function() {
@@ -276,11 +341,38 @@
                 return;
             }
 
+            if (method === 'flutterwave') {
+                if (!PAYMENT || !PAYMENT.flutterwaveEnabled) return;
+                if (!PAYMENT.flutterwavePublicKey) return;
+                if (typeof window.FlutterwaveCheckout === 'undefined' && typeof window.getpaidSetup === 'undefined') return;
+                setSubmitting(form, true);
+                openFlutterwavePayment(payload, customer, currency)
+                    .then(function(result) {
+                        const txRef = (result && result.tx_ref) || orderRef;
+                        const transactionId = (result && result.transaction_id) || '';
+                        return verifyPayment(Object.assign({}, payload, {
+                            provider: 'flutterwave',
+                            tx_ref: txRef,
+                            transaction_id: transactionId,
+                            reference: txRef
+                        })).then(function() {
+                            window.location.href = 'success.html?ref=' + encodeURIComponent(txRef);
+                        }).catch(function(error) {
+                            window.location.href = 'payment-failed.html?ref=' + encodeURIComponent(txRef) + '&reason=' + encodeURIComponent(error && error.message ? error.message : 'Payment verification failed');
+                        });
+                    })
+                    .catch(function() {
+                        setSubmitting(form, false);
+                    });
+                return;
+            }
+
             if (!PAYMENT || !PAYMENT.paystackEnabled) return;
             if (!PAYMENT.paystackPublicKey) return;
             if (typeof PaystackPop === 'undefined' || !PaystackPop || typeof PaystackPop.setup !== 'function') return;
 
             setSubmitting(form, true);
+            trackOrderAttempt(orderRef, 'paystack_started', { amount: Math.round(Number(payload.expected_amount || 0) * 100), currency: currency });
             const handler = PaystackPop.setup({
                 key: PAYMENT.paystackPublicKey,
                 email: customer.email,
@@ -295,7 +387,7 @@
                 },
                 callback: function(response) {
                     const reference = response && response.reference ? String(response.reference) : orderRef;
-                    verifyPayment(Object.assign({}, payload, { reference: reference }))
+                    verifyPayment(Object.assign({}, payload, { provider: 'paystack', reference: reference }))
                         .then(function() {
                             window.location.href = 'success.html?ref=' + encodeURIComponent(reference);
                         })
@@ -307,6 +399,7 @@
                         });
                 },
                 onClose: function() {
+                    trackOrderAttempt(orderRef, 'paystack_closed', {});
                     setSubmitting(form, false);
                 }
             });

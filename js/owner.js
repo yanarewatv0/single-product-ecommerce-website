@@ -169,6 +169,71 @@
         return String(value || '').length > 100 || /description|instructions|answer|text|address|subheadline|headline|note/i.test(key);
     }
 
+    function isImageField(key, value) {
+        const keyLower = String(key || '').toLowerCase();
+        const valueLower = String(value || '').toLowerCase();
+        const keyHit = /image|logo|file|gallery|socialimage|photo|picture|banner|thumb|og:image/i.test(keyLower);
+        const valueHit = /\.(jpg|jpeg|png|webp|gif|svg|avif|bmp)(\?|$)/i.test(valueLower);
+        const cdnHit = valueLower.startsWith('/cdn/') || valueLower.indexOf('/cdn/') >= 0;
+        return keyHit || valueHit || cdnHit;
+    }
+
+    function resolveImagePreviewUrl(rawValue) {
+        const value = String(rawValue || '').trim();
+        if (!value) return '';
+        if (/^https?:\/\//i.test(value)) return value;
+        if (value.startsWith('//')) return 'https:' + value;
+        if (value.startsWith('/cdn/')) return value;
+        if (value.startsWith('/')) return value;
+        return '/' + value.replace(/^\/+/, '');
+    }
+
+    function getUploadConfigKeyFromPath(path) {
+        const parts = Array.isArray(path) ? path.slice() : [];
+        const clean = parts.map(function(p) { return String(p || ''); }).filter(Boolean);
+        if (!clean.length) return '';
+        return clean[clean.length - 1] + '|' + clean.join('.');
+    }
+
+    function uploadImageToR2(file, configKey, progressCallback) {
+        return new Promise(function(resolve, reject) {
+            const token = getAuthToken();
+            if (!token) return reject(new Error('Not logged in. Please sign into the owner dashboard first.'));
+
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('key', String(configKey || ''));
+
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', getApiUrl('/api/owner/upload'), true);
+            xhr.setRequestHeader('Authorization', 'Basic ' + token);
+
+            xhr.upload.onprogress = function(event) {
+                if (!event.lengthComputable) return;
+                const pct = Math.round((event.loaded / event.total) * 100);
+                if (typeof progressCallback === 'function') progressCallback(pct);
+            };
+
+            xhr.onload = function() {
+                let payload;
+                try {
+                    payload = JSON.parse(xhr.responseText || '{}');
+                } catch (error) {
+                    payload = {};
+                }
+                if (xhr.status >= 200 && xhr.status < 300 && payload && payload.success) {
+                    resolve(payload);
+                } else {
+                    reject(new Error(payload && payload.error ? payload.error : ('Upload failed with HTTP ' + xhr.status)));
+                }
+            };
+
+            xhr.onerror = function() { reject(new Error('Network error during upload')); };
+            xhr.onabort = function() { reject(new Error('Upload cancelled')); };
+            xhr.send(formData);
+        });
+    }
+
     function setDraftValue(path, value) {
         if (!path.length) {
             settingsDraft[activeSettingsKey] = value;
@@ -229,6 +294,98 @@
             input.step = Number.isInteger(value) ? '1' : 'any';
             input.addEventListener('input', function() { setDraftValue(path, input.value === '' ? 0 : Number(input.value)); });
             wrapper.appendChild(input);
+        } else if (typeof value === 'string' && isImageField(key, value)) {
+            const stack = document.createElement('div');
+            stack.style.display = 'grid';
+            stack.style.gap = '10px';
+
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.value = value === null || value === undefined ? '' : value;
+            input.placeholder = 'Paste URL or /cdn/... path';
+            input.addEventListener('input', function() {
+                setDraftValue(path, input.value);
+                thumb.src = resolveImagePreviewUrl(input.value);
+            });
+            stack.appendChild(input);
+
+            const actions = document.createElement('div');
+            actions.style.display = 'flex';
+            actions.style.flexWrap = 'wrap';
+            actions.style.alignItems = 'center';
+            actions.style.gap = '10px';
+
+            const uploadBtn = document.createElement('button');
+            uploadBtn.type = 'button';
+            uploadBtn.className = 'btn btn-secondary';
+            uploadBtn.textContent = 'Upload Image';
+            uploadBtn.style.padding = '8px 14px';
+            uploadBtn.style.fontSize = '13px';
+
+            const fileInput = document.createElement('input');
+            fileInput.type = 'file';
+            fileInput.accept = 'image/*';
+            fileInput.style.display = 'none';
+
+            const status = document.createElement('span');
+            status.style.fontSize = '12px';
+            status.style.color = 'var(--muted)';
+            status.style.fontWeight = '600';
+
+            uploadBtn.addEventListener('click', function() { fileInput.click(); });
+
+            fileInput.addEventListener('change', function() {
+                const file = fileInput.files && fileInput.files[0];
+                if (!file) return;
+                const configKey = getUploadConfigKeyFromPath(path);
+                uploadBtn.disabled = true;
+                uploadBtn.style.opacity = '0.7';
+                status.style.color = 'var(--muted)';
+                status.textContent = 'Uploading 0%';
+                uploadImageToR2(file, configKey, function(percent) {
+                    status.textContent = 'Uploading ' + Math.round(percent) + '%';
+                }).then(function(payload) {
+                    const url = (payload && payload.url) || '';
+                    if (url) {
+                        input.value = url;
+                        setDraftValue(path, url);
+                        thumb.src = resolveImagePreviewUrl(url);
+                    }
+                    status.style.color = '#059669';
+                    status.textContent = (payload && payload.name ? payload.name + ' ' : '') + 'Uploaded successfully';
+                    setTimeout(function() { status.textContent = ''; }, 4000);
+                }).catch(function(error) {
+                    status.style.color = '#dc2626';
+                    status.textContent = error && error.message ? error.message : 'Upload failed';
+                }).finally(function() {
+                    uploadBtn.disabled = false;
+                    uploadBtn.style.opacity = '';
+                    fileInput.value = '';
+                });
+            });
+
+            actions.appendChild(uploadBtn);
+            actions.appendChild(fileInput);
+            actions.appendChild(status);
+            stack.appendChild(actions);
+
+            const thumb = document.createElement('img');
+            thumb.alt = humanizeKey(key) + ' preview';
+            thumb.style.maxWidth = '220px';
+            thumb.style.maxHeight = '160px';
+            thumb.style.width = 'auto';
+            thumb.style.height = 'auto';
+            thumb.style.borderRadius = '12px';
+            thumb.style.border = '1px solid var(--border)';
+            thumb.style.background = '#fff';
+            thumb.style.objectFit = 'contain';
+            thumb.style.display = 'none';
+            thumb.addEventListener('load', function() { thumb.style.display = ''; });
+            thumb.addEventListener('error', function() { thumb.style.display = 'none'; });
+            if (input.value) thumb.src = resolveImagePreviewUrl(input.value);
+            stack.appendChild(thumb);
+
+            wrapper.appendChild(stack);
         } else {
             const isColor = /color/i.test(key) && /^#[0-9a-f]{6}$/i.test(String(value));
             const input = document.createElement(isLongText(key, value) ? 'textarea' : 'input');

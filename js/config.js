@@ -677,10 +677,12 @@ var WHATSAPP_NUMBERS = [
 // Edit this section for Paystack and manual payment visibility.
 // =========================================================
 var PAYMENT = {
-    paystackEnabled: true, // Set to false to hide Paystack
-    manualEnabled: true, // Set to false to hide Manual Bank Transfer
-    manualReceiptRequired: true, // Set to false if receipt upload should be optional
+    paystackEnabled: true,
+    flutterwaveEnabled: false,
+    manualEnabled: true,
+    manualReceiptRequired: true,
     paystackPublicKey: "pk_test_d81cbc3f5d3f34ad13bb5b6626b869bb4545b02a",
+    flutterwavePublicKey: "",
     currency: "NGN"
 };
 
