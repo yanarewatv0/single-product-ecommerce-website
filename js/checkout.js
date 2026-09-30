@@ -1,6 +1,22 @@
 (function() {
     'use strict';
 
+    var DEFAULT_MANUAL_PAYMENT = typeof MANUAL_PAYMENT !== 'undefined' && MANUAL_PAYMENT && typeof MANUAL_PAYMENT === 'object'
+        ? JSON.parse(JSON.stringify(MANUAL_PAYMENT))
+        : { enabled: true, bankName: '', accountName: '', accountNumber: '', instructions: '', paymentDeadline: '' };
+
+    function resolveManualPayment() {
+        var base = (typeof MANUAL_PAYMENT !== 'undefined' && MANUAL_PAYMENT && typeof MANUAL_PAYMENT === 'object') ? MANUAL_PAYMENT : {};
+        return {
+            enabled: typeof base.enabled === 'boolean' ? base.enabled : Boolean(DEFAULT_MANUAL_PAYMENT.enabled),
+            bankName: String(base.bankName != null ? base.bankName : DEFAULT_MANUAL_PAYMENT.bankName || '').trim(),
+            accountName: String(base.accountName != null ? base.accountName : DEFAULT_MANUAL_PAYMENT.accountName || '').trim(),
+            accountNumber: String(base.accountNumber != null ? base.accountNumber : DEFAULT_MANUAL_PAYMENT.accountNumber || '').trim(),
+            instructions: String(base.instructions != null ? base.instructions : DEFAULT_MANUAL_PAYMENT.instructions || '').trim(),
+            paymentDeadline: String(base.paymentDeadline != null ? base.paymentDeadline : DEFAULT_MANUAL_PAYMENT.paymentDeadline || '').trim()
+        };
+    }
+
     function $(selector, root) {
         return (root || document).querySelector(selector);
     }
@@ -185,38 +201,63 @@
 
     function initPaymentUi(form) {
         const methods = $all('.payment-method', form);
-        const manualInfo = $('.manual-payment-info', form);
         const receiptGroup = $('#manual-receipt-group', form);
         const manualRadio = $('input[name="payment"][value="manual"]', form);
         const paystackRadio = $('input[name="payment"][value="paystack"]', form);
         const flutterwaveRadio = $('input[name="payment"][value="flutterwave"]', form);
 
-        const paystackEnabled = Boolean(PAYMENT && PAYMENT.paystackEnabled);
-        const flutterwaveEnabled = Boolean(PAYMENT && PAYMENT.flutterwaveEnabled);
-        const manualEnabled = Boolean(PAYMENT && PAYMENT.manualEnabled && MANUAL_PAYMENT && MANUAL_PAYMENT.enabled);
+        var manualInfo = $('.manual-payment-info', form) || $('.manual-payment-info');
+        if (!manualInfo && receiptGroup && receiptGroup.parentNode) {
+            manualInfo = document.createElement('div');
+            manualInfo.className = 'manual-payment-info';
+            receiptGroup.parentNode.insertBefore(manualInfo, receiptGroup);
+        }
+
+        function getManualEnabled() {
+            const mp = resolveManualPayment();
+            return Boolean(PAYMENT && PAYMENT.manualEnabled && mp.enabled);
+        }
+
+        function getPaystackEnabled() { return Boolean(PAYMENT && PAYMENT.paystackEnabled); }
+        function getFlutterwaveEnabled() { return Boolean(PAYMENT && PAYMENT.flutterwaveEnabled); }
 
         methods.forEach(function(card) {
             const key = String(card.getAttribute('data-payment') || '');
-            if (key === 'paystack') card.style.display = paystackEnabled ? '' : 'none';
-            if (key === 'flutterwave') card.style.display = flutterwaveEnabled ? '' : 'none';
-            if (key === 'manual') card.style.display = manualEnabled ? '' : 'none';
+            if (key === 'paystack') card.style.display = getPaystackEnabled() ? '' : 'none';
+            if (key === 'flutterwave') card.style.display = getFlutterwaveEnabled() ? '' : 'none';
+            if (key === 'manual') card.style.display = getManualEnabled() ? '' : 'none';
         });
 
         function renderManualInfo() {
             if (!manualInfo) return;
-            if (!manualEnabled) {
+            if (!getManualEnabled()) {
                 manualInfo.innerHTML = '';
+                manualInfo.classList.remove('visible');
+                manualInfo.style.display = 'none';
                 return;
             }
-            manualInfo.innerHTML =
-                '<div style="margin-top:14px;padding:14px;border:1px solid var(--border);border-radius:14px;background:#fff;display:grid;gap:8px;">' +
-                '<div style="font-weight:800;">Bank Transfer Details</div>' +
-                '<div style="display:flex;justify-content:space-between;gap:10px;"><span style="color:var(--muted);">Bank</span><span style="font-weight:800;">' + String(MANUAL_PAYMENT.bankName || '') + '</span></div>' +
-                '<div style="display:flex;justify-content:space-between;gap:10px;"><span style="color:var(--muted);">Account Name</span><span style="font-weight:800;">' + String(MANUAL_PAYMENT.accountName || '') + '</span></div>' +
-                '<div style="display:flex;justify-content:space-between;gap:10px;"><span style="color:var(--muted);">Account Number</span><span style="font-weight:900;">' + String(MANUAL_PAYMENT.accountNumber || '') + '</span></div>' +
-                (MANUAL_PAYMENT.paymentDeadline ? ('<div style="margin-top:6px;color:var(--muted);font-size:13px;line-height:1.6;">' + String(MANUAL_PAYMENT.paymentDeadline || '') + '</div>') : '') +
-                (MANUAL_PAYMENT.instructions ? ('<div style="margin-top:6px;color:var(--muted);font-size:13px;line-height:1.6;">' + String(MANUAL_PAYMENT.instructions || '') + '</div>') : '') +
-                '</div>';
+            const mp = resolveManualPayment();
+            const rows = [
+                mp.bankName ? '<div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;"><span style="color:var(--muted);">Bank</span><span style="font-weight:800;">' + mp.bankName + '</span></div>' : '',
+                mp.accountName ? '<div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;"><span style="color:var(--muted);">Account Name</span><span style="font-weight:800;">' + mp.accountName + '</span></div>' : '',
+                mp.accountNumber ? '<div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;"><span style="color:var(--muted);">Account Number</span><span style="font-weight:900;word-break:break-all;">' + mp.accountNumber + '</span></div>' : '',
+                mp.paymentDeadline ? '<div style="margin-top:6px;color:var(--muted);font-size:13px;line-height:1.6;">' + mp.paymentDeadline + '</div>' : '',
+                mp.instructions ? '<div style="margin-top:6px;color:var(--muted);font-size:13px;line-height:1.6;">' + mp.instructions + '</div>' : ''
+            ].filter(Boolean).join('');
+
+            if (!rows) {
+                manualInfo.innerHTML =
+                    '<div style="margin-top:14px;padding:14px;border:1px solid var(--border);border-radius:14px;background:#fff;display:grid;gap:8px;">' +
+                    '<div style="font-weight:800;">Bank Transfer Details</div>' +
+                    '<div style="color:var(--muted);font-size:13px;line-height:1.6;">Bank account details will be shown here once configured in the store settings. You may still complete your order by uploading a receipt below after making the transfer.</div>' +
+                    '</div>';
+            } else {
+                manualInfo.innerHTML =
+                    '<div style="margin-top:14px;padding:14px;border:1px solid var(--border);border-radius:14px;background:#fff;display:grid;gap:8px;">' +
+                    '<div style="font-weight:800;">Bank Transfer Details</div>' +
+                    rows +
+                    '</div>';
+            }
         }
 
         function syncSelectedState() {
@@ -224,6 +265,13 @@
             methods.forEach(function(card) {
                 card.classList.toggle('selected', String(card.getAttribute('data-payment') || '') === selected);
             });
+
+            renderManualInfo();
+            if (manualInfo) {
+                const show = selected === 'manual' && getManualEnabled();
+                manualInfo.classList.toggle('visible', show);
+                manualInfo.style.display = show ? 'block' : 'none';
+            }
 
             if (receiptGroup) {
                 const showReceipt = selected === 'manual' && Boolean(PAYMENT && PAYMENT.manualReceiptRequired);
@@ -233,13 +281,11 @@
             }
         }
 
-        renderManualInfo();
-
-        if (paystackEnabled && paystackRadio) paystackRadio.checked = true;
-        if (!paystackEnabled && flutterwaveEnabled && flutterwaveRadio) flutterwaveRadio.checked = true;
-        if (!paystackEnabled && !flutterwaveEnabled && manualEnabled && manualRadio) manualRadio.checked = true;
-        if (!manualEnabled && !flutterwaveEnabled && paystackEnabled && paystackRadio) paystackRadio.checked = true;
-        if (!manualEnabled && !paystackEnabled && flutterwaveEnabled && flutterwaveRadio) flutterwaveRadio.checked = true;
+        if (getPaystackEnabled() && paystackRadio) paystackRadio.checked = true;
+        if (!getPaystackEnabled() && getFlutterwaveEnabled() && flutterwaveRadio) flutterwaveRadio.checked = true;
+        if (!getPaystackEnabled() && !getFlutterwaveEnabled() && getManualEnabled() && manualRadio) manualRadio.checked = true;
+        if (!getManualEnabled() && !getFlutterwaveEnabled() && getPaystackEnabled() && paystackRadio) paystackRadio.checked = true;
+        if (!getManualEnabled() && !getPaystackEnabled() && getFlutterwaveEnabled() && flutterwaveRadio) flutterwaveRadio.checked = true;
 
         methods.forEach(function(card) {
             card.addEventListener('click', function() {
