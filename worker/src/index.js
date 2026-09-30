@@ -21,6 +21,11 @@ export default {
             return new Response(null, { headers: corsHeaders });
         }
 
+        // CDN serving from R2 bucket (public image routes) — MUST run before ASSETS.fetch fallback
+        if (path.startsWith('/cdn/')) {
+            return handleCdnServe(request, env);
+        }
+
         // Paystack Webhook
         if (path === '/api/paystack-webhook' && request.method === 'POST') {
             return handlePaystackWebhook(request, env);
@@ -88,11 +93,6 @@ export default {
 
         if (path === '/api/health' && request.method === 'GET') {
             return handleHealthCheck(env);
-        }
-
-        // CDN serving from R2 bucket (public image routes)
-        if (path.startsWith('/cdn/')) {
-            return handleCdnServe(request, env);
         }
 
         if (path.startsWith('/api/')) {
@@ -1078,7 +1078,7 @@ function handleHealthCheck(env) {
         gmailSmtpConfigured: Boolean(env.GMAIL_SMTP_USER && env.GMAIL_SMTP_PASSWORD),
         resendConfigured: Boolean(env.RESEND_API_KEY),
         r2BucketBound: Boolean(r2Bucket),
-        r2BucketNamed: Boolean(env.R2_BUCKET_NAME)
+        r2BucketNamed: Boolean(env.R2_BUCKET_NAME || r2Bucket)
     };
     const missing = Object.keys(checks).filter(function(key) { return checks[key] === false; });
     let availableKeys = [];

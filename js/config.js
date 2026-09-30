@@ -1110,6 +1110,42 @@ if (typeof window !== 'undefined' && typeof fetch === 'function') {
             PMELAB_CONFIG_KEYS.forEach(function(key) {
                 if (Object.prototype.hasOwnProperty.call(saved, key)) window[key] = saved[key];
             });
+            (function rebuildProductImagesFromProduct() {
+                if (typeof PRODUCT_IMAGES === 'undefined' || !Array.isArray(PRODUCT_IMAGES)) return;
+                if (typeof PRODUCT === 'undefined' || !PRODUCT || typeof PRODUCT !== 'object') return;
+                var descriptions = [
+                    'Front view of the PMELAB Power Bank',
+                    'Detailed view of the power bank ports and indicators',
+                    'PMELAB Power Bank being used on the go',
+                    'Compact size comparison with smartphone',
+                    'Lifestyle product image for marketing and customer trust'
+                ];
+                for (var i = 0; i < 10; i += 1) {
+                    var slotIndex = i;
+                    var field = 'image' + (i + 1);
+                    var newValue = PRODUCT[field];
+                    if (newValue === undefined || newValue === null) continue;
+                    var str = String(newValue).trim();
+                    if (slotIndex >= PRODUCT_IMAGES.length) {
+                        PRODUCT_IMAGES.push({ enabled: !!str, file: str, description: descriptions[slotIndex] || ('Product image ' + (i + 1)) });
+                        continue;
+                    }
+                    if (str) {
+                        PRODUCT_IMAGES[slotIndex].enabled = true;
+                        PRODUCT_IMAGES[slotIndex].file = str;
+                    } else {
+                        PRODUCT_IMAGES[slotIndex].enabled = false;
+                    }
+                    if (!PRODUCT_IMAGES[slotIndex].description) {
+                        PRODUCT_IMAGES[slotIndex].description = descriptions[slotIndex] || ('Product image ' + (i + 1));
+                    }
+                }
+            })();
+            if (typeof LOGO !== 'undefined' && LOGO && typeof PRODUCT === 'object' && PRODUCT) {
+                if (PRODUCT.heroImage && String(PRODUCT.heroImage).trim()) {
+                    // hero image stored in PRODUCT also used as primary fallback for og/twitter meta if SEO missing
+                }
+            }
         })
         .catch(function() {});
 }
